@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""Run the Tarot CLI directly from this project folder."""
+
+import sys
+from pathlib import Path
+
+
+PROJECT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(PROJECT_DIR / "src"))
+
+from tarot_cli.cli import main  # noqa: E402
+
+
+if __name__ == "__main__":
+    main()

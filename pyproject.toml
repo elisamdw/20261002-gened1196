@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "local-tarot-cli"
+version = "0.1.0"
+description = "Generate tarot card images with Replicate and upload them to Google Drive."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+tarot = "tarot_cli.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

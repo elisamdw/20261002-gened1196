@@ -1,0 +1,215 @@
+import json
+import random
+import tempfile
+import unittest
+from datetime import datetime
+from pathlib import Path
+from unittest.mock import patch
+
+from tarot_cli.cli import (
+    build_filename,
+    build_prompt,
+    choose_three_elements,
+    expand_card_requests,
+    gws_executable,
+    main,
+    parse_json_object,
+    plan_card,
+    set_anthropic_workspace,
+    slugify,
+    unique_path,
+)
+
+
+class TarotCliTests(unittest.TestCase):
+    candidates = [
+        {"name": "moonflower", "category": "plant", "symbolic_role": "hidden growth"},
+        {"name": "black fern", "category": "plant", "symbolic_role": "secret memory"},
+        {"name": "white moth", "category": "animal", "symbolic_role": "fragile seeking"},
+        {"name": "red fox", "category": "animal", "symbolic_role": "clever passage"},
+        {"name": "cracked mirror", "category": "object", "symbolic_role": "divided self"},
+        {"name": "brass bell", "category": "object", "symbolic_role": "awakening"},
+        {"name": "lunar halo", "category": "celestial", "symbolic_role": "uncertainty"},
+        {"name": "flooded garden", "category": "landscape", "symbolic_role": "emotion"},
+        {"name": "silver thread", "category": "material", "symbolic_role": "connection"},
+        {"name": "obsidian key", "category": "object", "symbolic_role": "sealed knowledge"},
+    ]
+    direction = {
+        "candidates": candidates,
+        "selected": candidates[:3],
+    }
+
+    def test_slugify_prompt_words(self):
+        self.assertEqual(slugify(["The", "Moon!", "Silver & Blue"]), "the-moon-silver-blue")
+
+    def test_build_filename(self):
+        now = datetime(2026, 9, 2, 14, 5, 9)
+        self.assertEqual(
+            build_filename(["word1", "word2", "word3"], now),
+            "20260902-140509-word1-word2-word3.png",
+        )
+
+    def test_each_word_can_have_its_own_filename(self):
+        now = datetime(2026, 9, 2, 14, 5, 9)
+        filenames = [build_filename([word], now) for word in ["sun", "moon", "stars"]]
+        self.assertEqual(
+            filenames,
+            [
+                "20260902-140509-sun.png",
+                "20260902-140509-moon.png",
+                "20260902-140509-stars.png",
+            ],
+        )
+
+    def test_build_prompt_includes_trigger(self):
+        prompt = build_prompt(["a", "silver", "moon"])
+        self.assertIn("A person giving a TED talk on a TED stage", prompt)
+        self.assertIn('"a silver moon"', prompt)
+        self.assertIn("in the style of TOK a trtcrd tarot style", prompt)
+        self.assertIn("centered along the bottom", prompt)
+
+    def test_build_prompt_includes_claude_symbols(self):
+        prompt = build_prompt(["moon"], self.direction)
+        self.assertIn("moonflower", prompt)
+        self.assertIn("white moth", prompt)
+        self.assertNotIn("cracked mirror", prompt)
+        self.assertIn("TED logo", prompt)
+        self.assertIn('exact quoted title "moon"', prompt)
+        self.assertIn("additional major symbols", prompt)
+
+    def test_choose_three_from_exactly_ten_candidates(self):
+        chosen = choose_three_elements(self.candidates, random.Random(42))
+        self.assertEqual(len(chosen), 3)
+        self.assertEqual(len({item["name"] for item in chosen}), 3)
+        self.assertTrue(all(item in self.candidates for item in chosen))
+
+    def test_expand_card_requests_with_copy_counts(self):
+        self.assertEqual(
+            expand_card_requests(["biscuit", "3", "the moon", "2", "sun"]),
+            [
+                ("biscuit", 1, 3),
+                ("biscuit", 2, 3),
+                ("biscuit", 3, 3),
+                ("the moon", 1, 2),
+                ("the moon", 2, 2),
+                ("sun", 1, 1),
+            ],
+        )
+
+    def test_expand_card_requests_rejects_invalid_counts(self):
+        with self.assertRaisesRegex(SystemExit, "between 1 and 5"):
+            expand_card_requests(["biscuit", "6"])
+        with self.assertRaisesRegex(SystemExit, "immediately follow"):
+            expand_card_requests(["3", "biscuit"])
+
+    def test_plan_card_parses_structured_claude_response(self):
+        response = {"content": [{"type": "text", "text": json.dumps({"elements": self.candidates})}]}
+        with patch("tarot_cli.cli.read_anthropic_key", return_value="test-key"):
+            with patch(
+                "tarot_cli.cli.anthropic_workspace_id",
+                return_value="wrkspc_test123",
+            ):
+                with patch(
+                    "tarot_cli.cli.anthropic_request", return_value=response
+                ) as call:
+                    with patch(
+                        "tarot_cli.cli.choose_three_elements",
+                        return_value=self.candidates[:3],
+                    ):
+                        direction = plan_card("moon")
+
+        self.assertEqual(direction, self.direction)
+        request_body = json.loads(call.call_args.args[0].data.decode("utf-8"))
+        self.assertEqual(request_body["model"], "claude-sonnet-5-5")
+        self.assertEqual(request_body["max_tokens"], 2048)
+        self.assertNotIn("thinking", request_body)
+        self.assertEqual(
+            request_body["output_config"]["format"]["type"], "json_schema"
+        )
+        self.assertIn("exactly ten", request_body["messages"][0]["content"])
+        self.assertEqual(
+            call.call_args.args[0].get_header("Anthropic-workspace-id"),
+            "wrkspc_test123",
+        )
+
+    def test_parse_json_object_accepts_markdown_fence(self):
+        wrapped = "Here is the result:\n```json\n{\"elements\": []}\n```"
+        self.assertEqual(parse_json_object(wrapped), {"elements": []})
+
+    def test_plan_card_reports_truncated_structured_output(self):
+        response = {
+            "content": [{"type": "text", "text": '{"elements": ['}],
+            "stop_reason": "max_tokens",
+        }
+        with patch("tarot_cli.cli.read_anthropic_key", return_value="test-key"):
+            with patch("tarot_cli.cli.anthropic_workspace_id", return_value=""):
+                with patch("tarot_cli.cli.anthropic_request", return_value=response):
+                    with self.assertRaisesRegex(SystemExit, "cut off"):
+                        plan_card("moon")
+
+    def test_set_anthropic_workspace_preserves_other_config(self):
+        existing = {"drive_folder_id": "folder-id"}
+        with patch("tarot_cli.cli.load_config", return_value=existing):
+            with patch("tarot_cli.cli.save_config") as save:
+                set_anthropic_workspace("wrkspc_test123")
+
+        save.assert_called_once_with(
+            {
+                "drive_folder_id": "folder-id",
+                "anthropic_workspace_id": "wrkspc_test123",
+            }
+        )
+
+    def test_unique_path_does_not_overwrite(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            directory = Path(temp_dir)
+            existing = directory / "card.png"
+            existing.write_bytes(b"existing")
+            self.assertEqual(unique_path(directory, "card.png").name, "card-2.png")
+
+    def test_bundled_gws_is_available(self):
+        self.assertIsNotNone(gws_executable())
+
+    def test_main_generates_and_uploads_one_card_per_word(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = {
+                "output_dir": temp_dir,
+                "drive_folder_id": "drive-folder-id",
+            }
+            with patch("tarot_cli.cli.load_config", return_value=config):
+                with patch("tarot_cli.cli.plan_card", return_value=self.direction) as plan:
+                    with patch("tarot_cli.cli.generate_image") as generate:
+                        with patch("tarot_cli.cli.upload_to_drive") as upload:
+                            main(["sun", "moon", "stars"])
+
+            self.assertEqual(plan.call_count, 3)
+            self.assertEqual(generate.call_count, 3)
+            self.assertEqual(upload.call_count, 3)
+            self.assertEqual(
+                [call.args[0] for call in generate.call_args_list],
+                [["sun"], ["moon"], ["stars"]],
+            )
+
+    def test_main_generates_requested_number_of_copies(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = {
+                "output_dir": temp_dir,
+                "drive_folder_id": "drive-folder-id",
+            }
+            with patch("tarot_cli.cli.load_config", return_value=config):
+                with patch("tarot_cli.cli.plan_card", return_value=self.direction) as plan:
+                    with patch("tarot_cli.cli.generate_image") as generate:
+                        with patch("tarot_cli.cli.upload_to_drive") as upload:
+                            main(["biscuit", "3", "moon", "2"])
+
+            self.assertEqual(plan.call_count, 5)
+            self.assertEqual(generate.call_count, 5)
+            self.assertEqual(upload.call_count, 5)
+            self.assertEqual(
+                [call.args[0] for call in generate.call_args_list],
+                [["biscuit"], ["biscuit"], ["biscuit"], ["moon"], ["moon"]],
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

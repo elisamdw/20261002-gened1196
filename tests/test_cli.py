@@ -10,9 +10,13 @@ from tarot_cli.cli import (
     build_filename,
     build_prompt,
     choose_three_elements,
+    edit_card_text,
+    ensure_card_text,
     expand_card_requests,
     gws_executable,
+    inspect_card_text,
     main,
+    openai_output_text,
     parse_json_object,
     plan_card,
     set_anthropic_workspace,
@@ -87,12 +91,27 @@ class TarotCliTests(unittest.TestCase):
         self.assertEqual(
             expand_card_requests(["biscuit", "3", "the moon", "2", "sun"]),
             [
-                ("biscuit", 1, 3),
-                ("biscuit", 2, 3),
-                ("biscuit", 3, 3),
-                ("the moon", 1, 2),
-                ("the moon", 2, 2),
-                ("sun", 1, 1),
+                ("biscuit", 1, 3, False),
+                ("biscuit", 2, 3, False),
+                ("biscuit", 3, 3, False),
+                ("the moon", 1, 2, False),
+                ("the moon", 2, 2, False),
+                ("sun", 1, 1, False),
+            ],
+        )
+
+    def test_expand_card_requests_scopes_text_check_to_one_term(self):
+        self.assertEqual(
+            expand_card_requests(
+                ["biscuit", "--text", "3", "moon", "2", "sun", "--text"]
+            ),
+            [
+                ("biscuit", 1, 3, True),
+                ("biscuit", 2, 3, True),
+                ("biscuit", 3, 3, True),
+                ("moon", 1, 2, False),
+                ("moon", 2, 2, False),
+                ("sun", 1, 1, True),
             ],
         )
 
@@ -101,6 +120,99 @@ class TarotCliTests(unittest.TestCase):
             expand_card_requests(["biscuit", "6"])
         with self.assertRaisesRegex(SystemExit, "immediately follow"):
             expand_card_requests(["3", "biscuit"])
+        with self.assertRaisesRegex(SystemExit, "immediately follow"):
+            expand_card_requests(["--text", "biscuit"])
+
+    def test_openai_output_text_from_response_items(self):
+        response = {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {"type": "output_text", "text": '{"matches_exactly":true}'}
+                    ],
+                }
+            ]
+        }
+        self.assertEqual(
+            openai_output_text(response), '{"matches_exactly":true}'
+        )
+
+    def test_inspect_card_text_uses_vision_and_structured_output(self):
+        result_json = {"observed_text": "Biscuit", "matches_exactly": True}
+        response = {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {"type": "output_text", "text": json.dumps(result_json)}
+                    ],
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "card.png"
+            image_path.write_bytes(b"png-data")
+            with patch("tarot_cli.cli.openai_request", return_value=response) as call:
+                result = inspect_card_text(image_path, "Biscuit", "openai-key")
+
+        self.assertEqual(result, result_json)
+        request_body = json.loads(call.call_args.args[0].data.decode("utf-8"))
+        self.assertEqual(request_body["model"], "gpt-5.4-mini")
+        self.assertEqual(
+            request_body["text"]["format"]["type"], "json_schema"
+        )
+        self.assertIn(
+            "data:image/png;base64,",
+            request_body["input"][0]["content"][1]["image_url"],
+        )
+
+    def test_ensure_card_text_edits_only_after_failed_check(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "card.png"
+            image_path.write_bytes(b"original")
+            checks = [
+                {"observed_text": "Biscult", "matches_exactly": False},
+                {"observed_text": "Biscuit", "matches_exactly": True},
+            ]
+            with patch("tarot_cli.cli.inspect_card_text", side_effect=checks) as inspect:
+                with patch(
+                    "tarot_cli.cli.edit_card_text", return_value=b"corrected"
+                ) as edit:
+                    ensure_card_text(image_path, "Biscuit", "openai-key")
+
+            self.assertEqual(image_path.read_bytes(), b"corrected")
+            self.assertEqual(inspect.call_count, 2)
+            edit.assert_called_once_with(image_path, "Biscuit", "openai-key")
+
+    def test_ensure_card_text_skips_edit_when_title_is_correct(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "card.png"
+            image_path.write_bytes(b"original")
+            check = {"observed_text": "Biscuit", "matches_exactly": True}
+            with patch("tarot_cli.cli.inspect_card_text", return_value=check):
+                with patch("tarot_cli.cli.edit_card_text") as edit:
+                    ensure_card_text(image_path, "Biscuit", "openai-key")
+
+            edit.assert_not_called()
+            self.assertEqual(image_path.read_bytes(), b"original")
+
+    def test_edit_card_text_sends_multipart_image_and_decodes_png(self):
+        response = {
+            "data": [{"b64_json": "Y29ycmVjdGVkLXBuZw=="}],
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir) / "card.png"
+            image_path.write_bytes(b"original-png")
+            with patch("tarot_cli.cli.openai_request", return_value=response) as call:
+                corrected = edit_card_text(image_path, "Biscuit", "openai-key")
+
+        self.assertEqual(corrected, b"corrected-png")
+        request = call.call_args.args[0]
+        self.assertIn("multipart/form-data", request.get_header("Content-type"))
+        self.assertIn(b'name="image[]"', request.data)
+        self.assertIn(b"gpt-image-2.5-sunburst", request.data)
+        self.assertIn(b"Biscuit", request.data)
 
     def test_plan_card_parses_structured_claude_response(self):
         response = {"content": [{"type": "text", "text": json.dumps({"elements": self.candidates})}]}
@@ -209,6 +321,36 @@ class TarotCliTests(unittest.TestCase):
                 [call.args[0] for call in generate.call_args_list],
                 [["biscuit"], ["biscuit"], ["biscuit"], ["moon"], ["moon"]],
             )
+
+    def test_main_applies_text_check_to_every_copy_of_marked_term(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config = {
+                "output_dir": temp_dir,
+                "drive_folder_id": "drive-folder-id",
+            }
+            with patch("tarot_cli.cli.load_config", return_value=config):
+                with patch("tarot_cli.cli.read_openai_key", return_value="openai-key"):
+                    with patch(
+                        "tarot_cli.cli.plan_card", return_value=self.direction
+                    ):
+                        with patch("tarot_cli.cli.generate_image"):
+                            with patch("tarot_cli.cli.ensure_card_text") as ensure:
+                                with patch("tarot_cli.cli.upload_to_drive") as upload:
+                                    main(
+                                        [
+                                            "biscuit",
+                                            "--text",
+                                            "3",
+                                            "moon",
+                                            "2",
+                                        ]
+                                    )
+
+            self.assertEqual(ensure.call_count, 3)
+            self.assertTrue(
+                all(call.args[1:] == ("biscuit", "openai-key") for call in ensure.call_args_list)
+            )
+            self.assertEqual(upload.call_count, 5)
 
 
 if __name__ == "__main__":

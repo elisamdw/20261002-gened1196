@@ -26,14 +26,18 @@ You will need:
 
 - a Replicate API token;
 - an Anthropic API key;
+- an OpenAI API key only if you want to use the optional per-term `--text`
+  verification and correction pass;
 - an Anthropic workspace ID beginning with `wrkspc_` if the key is scoped only
   to an organization rather than a workspace;
 - a Google Cloud project **ID** (not merely its display name); and
 - a Google Drive folder that the Google account used for OAuth can edit.
 
-Each card makes one paid Claude request and one paid Replicate request. Finish
-the Drive preflight below before generating the first card so an OAuth problem
-does not occur after image generation.
+Each card makes one paid Claude request and one paid Replicate request. A card
+marked with `--text` also makes one paid OpenAI vision request; an incorrect
+title adds one image-edit request and a second vision verification request.
+Finish the Drive preflight below before generating the first card so an OAuth
+problem does not occur after image generation.
 
 ## Install on macOS
 
@@ -160,17 +164,21 @@ Do not generate a paid image until both commands succeed.
 
 Create an Anthropic API key in the
 [Claude Console](https://console.anthropic.com/settings/keys) and a Replicate
-API token, then run:
+API token. If you will use `--text`, also create an OpenAI API key from the
+[OpenAI API key page](https://platform.openai.com/api-keys). Then run:
 
 ```bash
 ./tarot setup
 ```
 
-The setup prompts for both API secrets, the Drive destination folder ID, and a
-local output folder. The Drive folder ID is the long value after `/folders/`
-in the folder's URL. Make sure the OAuth Google account can edit that folder.
+The setup prompts for the required Replicate and Anthropic secrets, the
+optional OpenAI secret, the Drive destination folder ID, and a local output
+folder. The Drive folder ID is the long value after `/folders/` in the folder's
+URL. Make sure the OAuth Google account can edit that folder.
 
-Both API secrets are stored in macOS Keychain, not in the project files.
+API secrets are stored in macOS Keychain, not in the project files. You can
+alternatively supply `REPLICATE_API_TOKEN`, `ANTHROPIC_API_KEY`, or
+`OPENAI_API_KEY` as environment variables.
 
 If the Anthropic key is organization-scoped, find the workspace ID in Claude
 Console under **Settings → Workspaces**, then run:
@@ -234,6 +242,37 @@ tarot biscuit 3 "the moon" 2 sun
 Each copy gets a fresh set of ten Claude candidates, a fresh random selection
 of three visual elements, its own Replicate generation, and its own Drive
 upload. When no number follows a term, the copy count defaults to one.
+
+### Verify and correct the printed title
+
+Place `--text` immediately after a term to have OpenAI inspect that card's
+bottom title after Replicate finishes. If it already matches the term exactly,
+the image is left unchanged. If it is missing, garbled, misspelled, or uses the
+wrong capitalization, OpenAI edits only the bottom title and checks the edited
+image again before it can be uploaded:
+
+```bash
+tarot biscuit --text moon
+```
+
+Here only `biscuit` gets the OpenAI pass; `moon` does not. The modifier is
+per-term rather than global, so repeat it after every term that needs checking:
+
+```bash
+tarot biscuit --text moon --text sun
+```
+
+A copy count and `--text` can appear in either order after the term. The
+modifier applies to every copy of that term:
+
+```bash
+tarot "Oral Formulaic Theory" --text 3 moon 2
+tarot "Oral Formulaic Theory" 3 --text moon 2
+```
+
+Both commands check all three Oral Formulaic Theory cards and do not check the
+two moon cards. If the correction still cannot be verified, the original local
+PNG is kept and that card is not uploaded.
 
 Before each Replicate generation, Claude Sonnet 5.5 creates exactly ten
 candidate visual elements drawn from plants, animals, objects, celestial
@@ -322,6 +361,23 @@ response and handles JSON wrapped in a Markdown code block:
 git pull
 ```
 
+### `--text` says no OpenAI API key was found
+
+Run `tarot setup` and paste the OpenAI key at its hidden prompt, or export it
+for the current shell:
+
+```bash
+export OPENAI_API_KEY="YOUR_OPENAI_API_KEY"
+```
+
+Do not put the key in a command you plan to save or share.
+
+### OpenAI image editing says organization verification is required
+
+Some accounts must complete API Organization Verification before using GPT
+Image models. Follow the link in the OpenAI error or complete verification in
+the OpenAI developer console, then retry the marked card.
+
 ### Image generation succeeded but Drive upload failed
 
 The PNG remains in the configured local output folder; it does not need to be
@@ -343,3 +399,5 @@ Repeat the Google login and `gws` setup locally on the Mac where `tarot` runs.
 - [Google Workspace CLI authentication and troubleshooting](https://github.com/googleworkspace/cli#authentication)
 - [Google OAuth for desktop applications](https://developers.google.com/identity/protocols/oauth2/native-app)
 - [Install Google Cloud CLI with Homebrew](https://docs.cloud.google.com/sdk/docs/downloads-homebrew)
+- [OpenAI image analysis](https://developers.openai.com/api/docs/guides/images-vision)
+- [OpenAI image editing](https://developers.openai.com/api/docs/guides/image-generation)

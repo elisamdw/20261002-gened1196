@@ -21,6 +21,8 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
+VERSION = "0.2.0"
+USER_AGENT = f"tarot-cli/{VERSION}"
 MODEL = (
     "apolinario/flux-tarot-v1:"
     "6c4ebdf049df552f8c02b3a7bbb3afec3d37b20924282bab8744f1168b6de470"
@@ -28,10 +30,16 @@ MODEL = (
 STYLE_TRIGGER = "in the style of TOK a trtcrd tarot style"
 REPLICATE_KEYCHAIN_SERVICE = "tarot-cli-replicate"
 ANTHROPIC_KEYCHAIN_SERVICE = "tarot-cli-anthropic"
+OPENAI_KEYCHAIN_SERVICE = "tarot-cli-openai"
 DEFAULT_OUTPUT_DIR = Path.home() / "Pictures" / "Tarot"
 PREDICTIONS_URL = "https://api.replicate.com/v1/predictions"
 ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
+OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
+OPENAI_IMAGE_EDITS_URL = "https://api.openai.com/v1/images/edits"
 CLAUDE_MODEL = "claude-sonnet-5-5"
+OPENAI_TEXT_MODEL = "gpt-5.4-mini"
+OPENAI_IMAGE_MODEL = "gpt-image-2.5-sunburst"
+TEXT_CHECK_MARKER = "__tarot_text_check__"
 
 VISUAL_ELEMENT_SCHEMA = {
     "type": "object",
@@ -70,6 +78,22 @@ SYMBOLIC_DIRECTION_SCHEMA = {
         },
     },
     "required": ["elements"],
+    "additionalProperties": False,
+}
+
+CARD_TEXT_CHECK_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "observed_text": {
+            "type": "string",
+            "description": "The title visibly printed along the bottom of the card.",
+        },
+        "matches_exactly": {
+            "type": "boolean",
+            "description": "Whether the bottom title exactly matches the expected text.",
+        },
+    },
+    "required": ["observed_text", "matches_exactly"],
     "additionalProperties": False,
 }
 
@@ -230,6 +254,14 @@ def read_anthropic_key() -> str:
     )
 
 
+def read_openai_key() -> str:
+    return read_secret(
+        "OPENAI_API_KEY",
+        OPENAI_KEYCHAIN_SERVICE,
+        "OpenAI API key for --text",
+    )
+
+
 def anthropic_workspace_id() -> str:
     """Return the workspace selected for an organization-scoped Claude key."""
     return (
@@ -264,6 +296,24 @@ def setup() -> None:
         )
     else:
         read_anthropic_key()
+
+    existing_openai_key = False
+    try:
+        read_openai_key()
+        existing_openai_key = True
+    except SystemExit:
+        pass
+    openai_key = getpass.getpass(
+        "OpenAI API key (optional, for --text; hidden; leave blank to keep/skip): "
+    ).strip()
+    if openai_key:
+        save_secret_to_keychain(
+            openai_key,
+            OPENAI_KEYCHAIN_SERVICE,
+            "OpenAI API key",
+        )
+    elif existing_openai_key:
+        print("Keeping the existing OpenAI API key.")
 
     existing_config = load_config()
     existing_workspace = existing_config.get("anthropic_workspace_id", "")
@@ -471,7 +521,7 @@ def plan_card(card_word: str) -> Dict[str, Any]:
         "x-api-key": read_anthropic_key(),
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
-        "user-agent": "tarot-cli/0.2",
+        "user-agent": USER_AGENT,
     }
     workspace_id = anthropic_workspace_id()
     if workspace_id:
@@ -558,7 +608,7 @@ def download_image(image_url: str, output_path: Path) -> None:
             raise SystemExit("Replicate returned an invalid image data URL.") from error
 
     try:
-        request = Request(image_url, headers={"User-Agent": "tarot-cli/0.1"})
+        request = Request(image_url, headers={"User-Agent": USER_AGENT})
         with urlopen(request, timeout=75) as response:
             with output_path.open("wb") as destination:
                 shutil.copyfileobj(response, destination)
@@ -596,7 +646,7 @@ def generate_image(
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
             "Prefer": "wait=60",
-            "User-Agent": "tarot-cli/0.1",
+            "User-Agent": USER_AGENT,
         },
     )
     prediction = wait_for_prediction(replicate_request(request), token)
@@ -637,6 +687,217 @@ def upload_to_drive(image_path: Path, folder_id: str) -> None:
     print(f"Uploaded to Google Drive: {image_path.name}")
 
 
+def openai_request(request: Request, timeout: int = 180) -> Dict[str, Any]:
+    """Send one OpenAI API request and return its JSON response."""
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")
+        if error.code == 401:
+            raise SystemExit(
+                "OpenAI rejected the API key. Run 'tarot setup' and save a valid key."
+            ) from error
+        raise SystemExit(f"OpenAI API error ({error.code}): {detail}") from error
+    except URLError as error:
+        raise SystemExit(f"Could not connect to OpenAI: {error.reason}") from error
+    except json.JSONDecodeError as error:
+        raise SystemExit("OpenAI returned an unreadable response.") from error
+
+
+def openai_output_text(response: Dict[str, Any]) -> str:
+    """Extract concatenated assistant text from a Responses API response."""
+    direct_text = response.get("output_text")
+    if isinstance(direct_text, str) and direct_text.strip():
+        return direct_text
+
+    text_parts = []
+    for item in response.get("output", []):
+        if item.get("type") != "message":
+            continue
+        for content in item.get("content", []):
+            if content.get("type") == "output_text":
+                text_parts.append(content.get("text", ""))
+            elif content.get("type") == "refusal":
+                raise SystemExit(
+                    "OpenAI declined to inspect the card: "
+                    + content.get("refusal", "unknown reason")
+                )
+    if not text_parts:
+        raise SystemExit("OpenAI did not return a card-text inspection result.")
+    return "".join(text_parts)
+
+
+def inspect_card_text(
+    image_path: Path, expected_text: str, openai_key: str
+) -> Dict[str, Any]:
+    """Read the bottom title with OpenAI vision and compare it to the term."""
+    try:
+        encoded_image = base64.b64encode(image_path.read_bytes()).decode("ascii")
+    except OSError as error:
+        raise SystemExit(f"Could not read {image_path} for text inspection: {error}") from error
+
+    expected_json = json.dumps(expected_text, ensure_ascii=False)
+    prompt = (
+        "Inspect only the title lettering centered along the bottom of this tarot card. "
+        "Ignore the TED logo and any lettering elsewhere in the artwork. The expected "
+        f"bottom title is {expected_json}. Transcribe the visible bottom title into "
+        "observed_text. Set matches_exactly to true only when spelling, spaces, "
+        "punctuation, and capitalization exactly match the expected title. If the title "
+        "is absent or unreadable, use an empty observed_text and false."
+    )
+    body = {
+        "model": OPENAI_TEXT_MODEL,
+        "input": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:image/png;base64,{encoded_image}",
+                        "detail": "high",
+                    },
+                ],
+            }
+        ],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "card_text_check",
+                "strict": True,
+                "schema": CARD_TEXT_CHECK_SCHEMA,
+            }
+        },
+        "max_output_tokens": 200,
+    }
+    request = Request(
+        OPENAI_RESPONSES_URL,
+        data=json.dumps(body).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {openai_key}",
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT,
+        },
+    )
+    response = openai_request(request)
+    try:
+        result = json.loads(openai_output_text(response))
+    except json.JSONDecodeError as error:
+        raise SystemExit("OpenAI returned an invalid card-text inspection result.") from error
+    if not isinstance(result.get("observed_text"), str) or not isinstance(
+        result.get("matches_exactly"), bool
+    ):
+        raise SystemExit("OpenAI returned an incomplete card-text inspection result.")
+    result["matches_exactly"] = bool(
+        result["matches_exactly"] and result["observed_text"] == expected_text
+    )
+    return result
+
+
+def multipart_image_request(
+    fields: Dict[str, str], image_path: Path
+) -> Tuple[bytes, str]:
+    """Build a multipart form body for one OpenAI image edit."""
+    boundary = f"tarot-{secrets.token_hex(16)}"
+    body = bytearray()
+    for name, value in fields.items():
+        body.extend(f"--{boundary}\r\n".encode("ascii"))
+        body.extend(
+            f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode(
+                "ascii"
+            )
+        )
+        body.extend(value.encode("utf-8"))
+        body.extend(b"\r\n")
+
+    filename = image_path.name.replace('"', "")
+    body.extend(f"--{boundary}\r\n".encode("ascii"))
+    body.extend(
+        (
+            'Content-Disposition: form-data; name="image[]"; '
+            f'filename="{filename}"\r\n'
+        ).encode("utf-8")
+    )
+    body.extend(b"Content-Type: image/png\r\n\r\n")
+    body.extend(image_path.read_bytes())
+    body.extend(b"\r\n")
+    body.extend(f"--{boundary}--\r\n".encode("ascii"))
+    return bytes(body), f"multipart/form-data; boundary={boundary}"
+
+
+def edit_card_text(image_path: Path, expected_text: str, openai_key: str) -> bytes:
+    """Ask GPT Image to preserve a card while repairing only its bottom title."""
+    expected_json = json.dumps(expected_text, ensure_ascii=False)
+    prompt = (
+        "Edit this exact existing vertical tarot card. Preserve its speaker, TED stage, "
+        "TED logo, border, colors, symbols, composition, and illustration style. Change "
+        "only the title lettering centered along the bottom. Remove any incorrect, "
+        "garbled, missing, or duplicate bottom title and replace it with exactly "
+        f"{expected_json}, with identical capitalization and punctuation. Make the title "
+        "clear and readable. Do not add any other text and do not redesign the card."
+    )
+    fields = {
+        "model": OPENAI_IMAGE_MODEL,
+        "prompt": prompt,
+        "quality": "high",
+        "size": "1024x1536",
+        "output_format": "png",
+    }
+    try:
+        body, content_type = multipart_image_request(fields, image_path)
+    except OSError as error:
+        raise SystemExit(f"Could not read {image_path} for text correction: {error}") from error
+    request = Request(
+        OPENAI_IMAGE_EDITS_URL,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {openai_key}",
+            "Content-Type": content_type,
+            "User-Agent": USER_AGENT,
+        },
+    )
+    response = openai_request(request)
+    try:
+        encoded_image = response["data"][0]["b64_json"]
+        return base64.b64decode(encoded_image, validate=True)
+    except (KeyError, IndexError, TypeError, ValueError) as error:
+        raise SystemExit("OpenAI completed without returning a corrected PNG.") from error
+
+
+def ensure_card_text(image_path: Path, expected_text: str, openai_key: str) -> None:
+    """Verify a title; edit and verify again only when it is incorrect."""
+    print(f'OpenAI is checking the bottom title against "{expected_text}"...')
+    first_check = inspect_card_text(image_path, expected_text, openai_key)
+    observed = first_check["observed_text"] or "(missing or unreadable)"
+    if first_check["matches_exactly"]:
+        print(f'OpenAI verified the title: "{expected_text}"')
+        return
+
+    print(f'OpenAI read "{observed}"; correcting the bottom title...')
+    corrected_bytes = edit_card_text(image_path, expected_text, openai_key)
+    temporary_path = image_path.with_name(
+        f".{image_path.stem}-openai-{secrets.token_hex(6)}.png"
+    )
+    try:
+        temporary_path.write_bytes(corrected_bytes)
+        second_check = inspect_card_text(temporary_path, expected_text, openai_key)
+        if not second_check["matches_exactly"]:
+            second_observed = second_check["observed_text"] or "missing or unreadable"
+            raise SystemExit(
+                "OpenAI edited the card, but could not verify the exact title "
+                f'afterward (read: "{second_observed}"). The original local image was '
+                "kept and nothing was uploaded."
+            )
+        temporary_path.replace(image_path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+    print(f'OpenAI corrected and verified the title: "{expected_text}"')
+
+
 def doctor() -> None:
     """Report whether the local dependencies and configuration are ready."""
     config = load_config()
@@ -657,38 +918,65 @@ def doctor() -> None:
     except SystemExit:
         pass
 
+    openai_available = False
+    try:
+        read_openai_key()
+        openai_available = True
+    except SystemExit:
+        pass
+
     for label, passed in checks.items():
         print(f"{'OK' if passed else 'MISSING':7} {label}")
+    print(
+        f"{'OK' if openai_available else 'OPTIONAL':7} "
+        "OpenAI key available for --text"
+    )
     if not all(checks.values()):
         raise SystemExit(1)
 
 
 def expand_card_requests(
     terms_and_counts: Sequence[str],
-) -> Sequence[Tuple[str, int, int]]:
-    """Expand TERM [1-5] pairs into (term, copy number, copy total) entries."""
+) -> Sequence[Tuple[str, int, int, bool]]:
+    """Expand term modifiers into (term, copy number, total, text check)."""
     requests = []
     position = 0
     while position < len(terms_and_counts):
         term = terms_and_counts[position]
-        if term.isdecimal():
+        if term.isdecimal() or term in {"--text", TEXT_CHECK_MARKER}:
             raise SystemExit(
-                f"Copy count '{term}' must immediately follow a card term."
+                f"Modifier '{term}' must immediately follow a card term."
             )
 
         copies = 1
-        if position + 1 < len(terms_and_counts):
-            possible_count = terms_and_counts[position + 1]
-            if possible_count.isdecimal():
-                copies = int(possible_count)
+        count_seen = False
+        check_text = False
+        position += 1
+        while position < len(terms_and_counts):
+            modifier = terms_and_counts[position]
+            if modifier in {"--text", TEXT_CHECK_MARKER}:
+                if check_text:
+                    raise SystemExit(f"--text was repeated for '{term}'.")
+                check_text = True
+                position += 1
+                continue
+            if modifier.isdecimal():
+                if count_seen:
+                    raise SystemExit(f"Multiple copy counts were provided for '{term}'.")
+                copies = int(modifier)
                 if not 1 <= copies <= 5:
                     raise SystemExit(
                         f"Copy count for '{term}' must be between 1 and 5."
                     )
+                count_seen = True
                 position += 1
+                continue
+            break
 
-        requests.extend((term, copy_number, copies) for copy_number in range(1, copies + 1))
-        position += 1
+        requests.extend(
+            (term, copy_number, copies, check_text)
+            for copy_number in range(1, copies + 1)
+        )
 
     return requests
 
@@ -698,7 +986,7 @@ def parser() -> argparse.ArgumentParser:
         prog="tarot",
         description=(
             "Generate tarot images and upload them to Google Drive. "
-            "Optionally follow each term with a copy count from 1 to 5."
+            "Optionally follow each term with --text and/or a copy count from 1 to 5."
         ),
     )
     command.add_argument(
@@ -711,6 +999,14 @@ def parser() -> argparse.ArgumentParser:
         ),
     )
     command.add_argument("--seed", type=int, help="Optional repeatable generation seed")
+    command.add_argument(
+        "--text",
+        action="store_true",
+        help=(
+            "For the immediately preceding term and all its copies, have OpenAI "
+            "verify and, only if needed, correct the bottom title"
+        ),
+    )
     command.add_argument(
         "--local-only",
         action="store_true",
@@ -736,7 +1032,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         set_anthropic_workspace(arguments[1])
         return
 
-    args = parser().parse_args(arguments)
+    parser_arguments = [
+        TEXT_CHECK_MARKER if argument == "--text" else argument
+        for argument in arguments
+    ]
+    args = parser().parse_args(parser_arguments)
     if not args.words:
         parser().print_help()
         raise SystemExit(2)
@@ -750,17 +1050,23 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         raise SystemExit("No Drive folder is configured. Run: tarot setup")
 
     requests = expand_card_requests(args.words)
+    openai_key = read_openai_key() if any(request[3] for request in requests) else ""
     batch_time = datetime.now().astimezone()
     total = len(requests)
-    for index, (word, copy_number, copy_total) in enumerate(requests, start=1):
+    for index, (word, copy_number, copy_total, check_text) in enumerate(
+        requests, start=1
+    ):
         copy_label = (
             f" (copy {copy_number} of {copy_total})" if copy_total > 1 else ""
         )
-        print(f"\nCard {index} of {total}: {word}{copy_label}")
+        text_label = " [OpenAI text check]" if check_text else ""
+        print(f"\nCard {index} of {total}: {word}{copy_label}{text_label}")
         filename = build_filename([word], now=batch_time)
         output_path = unique_path(output_dir, filename)
         symbolic_direction = plan_card(word)
         generate_image([word], output_path, args.seed, symbolic_direction)
+        if check_text:
+            ensure_card_text(output_path, word, openai_key)
 
         if not args.local_only:
             upload_to_drive(output_path, str(folder_id))
